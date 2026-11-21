@@ -7,6 +7,7 @@
 import * as fs from 'node:fs';
 import * as helper from './lib/helper.js';
 import { COMMANDS, HELP } from './lib/help.js';
+import * as standard from './lib/standard.js';
 
 // The adapter-core module gives you access to the core ioBroker functions
 // you need to create an adapter
@@ -30,6 +31,8 @@ class MatrixOrg extends utils.Adapter {
             ...options,
             name: 'matrix-org',
         });
+        // open questions of message.ask, the oldest first
+        this.pendingAsks = [];
         this.on('ready', this.onReady.bind(this));
         this.on('stateChange', this.onStateChange.bind(this));
         this.on('message', this.onMessage.bind(this));
@@ -145,6 +148,7 @@ class MatrixOrg extends utils.Adapter {
                     if (event.event.room_id === roomId) {
                         this.setState('receiveMessage', { val: event.event.content.body, ack: true });
                         messageUsed = true;
+                        this.answerAsk(event.event.content.body, event.event.sender);
                     } else {
                         reason = `roomid don't fit: ${event.event.content.room_id} is not the expected ${roomId}`;
                         this.log.debug(`room:${room} toStartOfTimeline${toStartOfTimeline}`);
@@ -234,30 +238,137 @@ class MatrixOrg extends utils.Adapter {
      */
     async sendFileToMatrix(buffer, fileType) {
         try {
-            const uploadResponse = await matrixClient.uploadContent(buffer, { rawResponse: false, type: fileType });
-            const matrixUrl = uploadResponse.content_uri;
-            let msgtype = matrix.MsgType.File;
-            let info = {};
-            let body = '';
-            if (fileType.startsWith('image')) {
-                msgtype = matrix.MsgType.Image;
-                body = `image.${fileType.split('/')[1]}`;
-            } else if (fileType.startsWith('video')) {
-                msgtype = matrix.MsgType.Video;
-                info = {
-                    mimetype: fileType,
-                };
-            }
-            const content = {
-                msgtype: msgtype,
-                url: matrixUrl,
-                info: info,
-                body: body,
-            };
-            await matrixClient.sendMessage(roomId, null, content, undefined);
+            await this.postFileToMatrix(buffer, fileType);
         } catch (err) {
             this.log.error(err);
             this.log.error('Sending of file failed');
+        }
+    }
+    /**
+     * upload the file and send it into the room, throws on errors
+     *
+     * @param buffer contain the binary data from the image
+     * @param fileType mime type of the image
+     * @returns the event id of the message
+     */
+    async postFileToMatrix(buffer, fileType) {
+        const uploadResponse = await matrixClient.uploadContent(buffer, { rawResponse: false, type: fileType });
+        const matrixUrl = uploadResponse.content_uri;
+        let msgtype = matrix.MsgType.File;
+        let info = {};
+        let body = '';
+        if (fileType.startsWith('image')) {
+            msgtype = matrix.MsgType.Image;
+            body = `image.${fileType.split('/')[1]}`;
+        } else if (fileType.startsWith('video')) {
+            msgtype = matrix.MsgType.Video;
+            info = {
+                mimetype: fileType,
+            };
+        }
+        const content = {
+            msgtype: msgtype,
+            url: matrixUrl,
+            info: info,
+            body: body,
+        };
+        const response = await matrixClient.sendMessage(roomId, null, content, undefined);
+        return response && response.event_id;
+    }
+    /**
+     * send in the form of the shared catalog (message.send {text, recipient?, title?, file?, files?, priority?},
+     * also html and the file forms of send), answers when it is sent
+     *
+     * @param message the message of the caller
+     * @returns the answer: ok, sent and id, or error and reason
+     */
+    async sendStandard(message) {
+        const refused = standard.checkRecipient(message.recipient, roomId, this.config.roomName);
+        if (refused) {
+            return refused;
+        }
+        const files = [
+            ...(message.file ? [message.file] : []),
+            ...(Array.isArray(message.files) ? message.files : message.files ? [message.files] : []),
+        ];
+        const text = standard.textOf(message.text ?? message.message ?? message.body);
+        const title = standard.textOf(message.title);
+        const html = standard.textOf(message.html);
+        if (!text && !html && !files.length) {
+            return { error: 'No text or file given', reason: 'BAD_REQUEST' };
+        }
+        if (!matrixClient || !roomId) {
+            return { error: 'The bot is not logged in', reason: 'NOT_CONNECTED' };
+        }
+        const ids = [];
+        try {
+            if (text || html) {
+                const data = { body: [title, text || html].filter(part => part).join('\n'), msgtype: 'm.text' };
+                if (html) {
+                    data.format = 'org.matrix.custom.html';
+                    data.formatted_body = title ? `<p><b>${escapeHtml(title)}</b></p>${html}` : html;
+                }
+                ids.push((await matrixClient.sendEvent(roomId, 'm.room.message', data)).event_id);
+            }
+            for (const file of files) {
+                const loaded = await standard.loadFile(file, message.contentType || message.type, (id, name) =>
+                    this.readFileAsync(id, name),
+                );
+                ids.push(await this.postFileToMatrix(loaded.buffer, loaded.type));
+            }
+        } catch (err) {
+            this.log.error(`Cannot send: ${err.message || err}`);
+            return { error: String(err.message || err), ...(ids.length ? { id: ids[0] } : {}) };
+        }
+        return ids[0] ? { ok: true, sent: 1, id: ids[0] } : { ok: true, sent: 1 };
+    }
+    /**
+     * message.ask of the shared catalog: sends the question and waits for the next text of another member
+     *
+     * @param message the question: text, answers, recipient, timeoutSec
+     * @returns the answer: answer, index and from, timeout, or error and reason
+     */
+    async ask(message) {
+        const request = message && typeof message === 'object' ? message : { text: message };
+        const text = standard.textOf(request.text);
+        if (!text) {
+            return { error: 'No text given', reason: 'BAD_REQUEST' };
+        }
+        const refused = standard.checkRecipient(request.recipient, roomId, this.config.roomName);
+        if (refused) {
+            return refused;
+        }
+        if (!matrixClient || !roomId) {
+            return { error: 'The bot is not logged in', reason: 'NOT_CONNECTED' };
+        }
+        const answers = (Array.isArray(request.answers) ? request.answers : []).map(standard.textOf).filter(a => a);
+        try {
+            const body = standard.askBody(text, answers);
+            await matrixClient.sendEvent(roomId, 'm.room.message', { body, msgtype: 'm.text' });
+        } catch (err) {
+            return { error: String(err.message || err) };
+        }
+        const seconds = Number(request.timeoutSec) > 0 ? Number(request.timeoutSec) : standard.ASK_TIMEOUT_SEC;
+        return new Promise(resolve => {
+            const pending = { answers, resolve, timer: null };
+            pending.timer = this.setTimeout(() => {
+                this.pendingAsks = this.pendingAsks.filter(item => item !== pending);
+                resolve({ timeout: true });
+            }, seconds * 1000);
+            this.pendingAsks.push(pending);
+        });
+    }
+    /**
+     * a text of another member of the room answers the oldest open question of message.ask
+     *
+     * @param body the text
+     * @param sender the user id of the sender
+     */
+    answerAsk(body, sender) {
+        const pending = this.pendingAsks.shift();
+        if (pending) {
+            this.clearTimeout(pending.timer);
+            pending.resolve(standard.askAnswer(body, pending.answers, sender));
         }
     }
     /**
@@ -410,6 +521,10 @@ class MatrixOrg extends utils.Adapter {
      */
     onUnload(callback) {
         this.unloaded = true;
+        for (const pending of this.pendingAsks.splice(0)) {
+            this.clearTimeout(pending.timer);
+            pending.resolve({ error: 'The adapter stops', reason: 'NOT_CONNECTED' });
+        }
         /*eslint no-unused-vars: ["error", { "caughtErrors": "none" }]*/
         try {
             if (matrixClient) {
@@ -463,11 +578,28 @@ class MatrixOrg extends utils.Adapter {
             // {"command":"send","message":{"file":"https://sciphy.de/toDownload/test.png"},"from":"system.adapter.javascript.0","_id":12345678}
             // {"command":"send","message":"Hello!","from":"system.adapter.javascript.0","_id":12345678}
             // {"command":"send","message":{"file":{"type":"image/png","base64":"iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAACmSURBVFhH7ZdhCoAgDEZnd9D737T8xJkNNY1Ef+yB2LTcC1qWOT20kCBgjIkh0WwfmeuIxyGYnRzIPElgFSqgAvsKOOdCzeZ1y7EcZzDG16HvwtckihLdA4xxk3HeGGttc17Cc+lN6Ds/dlO6w6/ItQHn7H4GcDK3Em/zNboE5KKjcQstQxVQARVYLlDdC2YzvBfMQgVUYB8BlMWfn2E1ZJ7Fv+dEF0UZoNhXp9NnAAAAAElFTkSuQmCC"}},"from":"system.adapter.javascript.0","_id":12345678}
+            const reply = answer => obj.callback && this.sendTo(obj.from, obj.command, answer, obj.callback);
             if (obj.command === 'help') {
                 // description of all commands for AI agents, also while the bot is not logged in
                 if (obj.callback) {
                     this.sendTo(obj.from, obj.command, { help: HELP, commands: COMMANDS }, obj.callback);
                 }
+                return;
+            }
+            if (obj.command === 'getRecipients') {
+                // message.getRecipients of the shared catalog: the room of the settings
+                reply({ recipients: standard.roomRecipients(roomId, this.config.roomName) });
+                return;
+            }
+            if (obj.command === 'ask') {
+                // message.ask of the shared catalog
+                this.ask(obj.message).then(reply);
+                return;
+            }
+            if (obj.command === 'send' && obj.message && typeof obj.message === 'object') {
+                // message.send of the shared catalog; a plain string keeps the old answer below
+                this.log.debug('send command arrived');
+                this.sendStandard(obj.message).then(reply);
                 return;
             }
             if (obj.message) {
@@ -490,10 +622,26 @@ class MatrixOrg extends utils.Adapter {
                             this.sendTo(obj.from, obj.command, 'Message computed', obj.callback);
                         }
                     }
+                    return;
                 }
             }
+            reply(
+                obj.command === 'send'
+                    ? { error: 'No text or file given', reason: 'BAD_REQUEST' }
+                    : { error: `Unknown command: ${obj.command}`, reason: 'NOT_SUPPORTED' },
+            );
         }
     }
+}
+
+/**
+ * escape a text for HTML
+ *
+ * @param text the text
+ * @returns the escaped text
+ */
+function escapeHtml(text) {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 const modulePath = url.fileURLToPath(import.meta.url);

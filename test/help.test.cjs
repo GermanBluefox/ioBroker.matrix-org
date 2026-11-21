@@ -25,9 +25,21 @@ suite("help", () => {
         assert.that([...names].sort()).is.equalTo(commandsOfMain().sort());
         done();
     });
-    test("marks only help as read-only", done => {
+    test("marks only help and getRecipients as read-only", done => {
         for (const { command, write } of COMMANDS) {
-            assert.that(write).is.equalTo(command !== "help");
+            assert.that(write).is.equalTo(command !== "help" && command !== "getRecipients");
+        }
+        done();
+    });
+    test("marks the commands of the shared catalog", done => {
+        const marks = Object.fromEntries(COMMANDS.filter(c => c.standard).map(c => [c.command, c.standard]));
+        assert.that(marks).is.equalTo({
+            send: "message.send",
+            ask: "message.ask",
+            getRecipients: "message.getRecipients",
+        });
+        for (const standard of Object.values(marks)) {
+            assert.that(HELP).is.containing(standard);
         }
         done();
     });
